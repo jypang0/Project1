@@ -1,92 +1,78 @@
 on:
   push:
-    branches: 
-      - master
-      - feature
+    branches: [main]
+  pull_request:
+    branches: [main]
 
-name: Docker Image build & k8s resources.yaml update
+name: AWS ECR push & deploy k8s
 
 jobs:
   deploy:
     name: Deploy
     runs-on: ubuntu-latest
+    environment: production
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v2
-    
-    - name: Set Dev env variables
-      if: endsWith(github.ref, '/feature')
-      run: |
-        echo "Feature branch"
-        echo "ENVIRONMENT=dev" >> $GITHUB_ENV
-        echo "DESTINATION=dev/테스트" >> $GITHUB_ENV
-        echo "BRANCH=feature" >> $GITHUB_ENV        
-    
-    - name: Set Prod env variables
-      if: endsWith(github.ref, '/master')
-      run: |
-        echo "Master branch"
-        echo "ENVIRONMENT=prod" >> $GITHUB_ENV
-        echo "DESTINATION=prod/테스트" >> $GITHUB_ENV
-        echo "BRANCH=master" >> $GITHUB_ENV        
-    
-    - name: Set commit msg 
-      env:
-        GITHUB_SHA: ${{ github.sha }}
-      run: |
-        echo "COMMIT_MSG=Update from https://github.com/your/테스트/$GITHUB_SHA" >> $GITHUB_ENV
-        echo $COMMIT_MSG        
-    #
-    # Push app image to ECR
-    #
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v1
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_VAL }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_VAL }}
-        aws-region: ap-northeast-2
+      # Github에 저장된 코드를 CI 서버로 내려받아 뒷 step에서 사용할 수 있도록 하는 과정
+      - name: Checkout
+        uses: actions/checkout@v2
 
-    - name: Login to Amazon ECR
-      id: login-ecr
-      uses: aws-actions/amazon-ecr-login@v1
+      # Github Secret과 local env 에 저장된 값 불러오기
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}   # secret에 저장되어 있는 값 불러오기
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-northeast-2
 
-    - name: Build, tag, and push image to Amazon ECR
-      id: build-image
-      env:
-        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
-        IMAGE_TAG: ${{ github.sha }}
-      run: |
-        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$ENVIRONMENT-$IMAGE_TAG {Dockerfile 경로}
-        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$ENVIRONMENT-$IMAGE_TAG
-        echo "::set-output name=image::$ECR_REGISTRY/$ECR_REPOSITORY:$ENVIRONMENT-$IMAGE_TAG"
-                
-    #
-    # Update Image tag to delployment.yaml
-    #
-    - name: Git config
-      run: |
-        git config --global user.email "actions@github.com"
-        git config --global user.name "GitHub Actions"
-                
-    - name: Check out k8s repo
-      uses: actions/checkout@master
-      with:
-        repository: your/gitops-repository
-        token: ${{ secrets.GIT_ACCESS_TOKEN }}
-        
-    - name: chmod repo destination
-      run: |
-        chmod +x $DESTINATION
-        ls
-                
-    - name: git push image tag to k8 repo 
-      env:
-        GITHUB_REPO: ${{ github.repository.name }}
-        GITHUB_SHA: ${{ github.sha }}
-      run: |
-        sed -i -e 's@${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:.*@${{ steps.build-image.outputs.image }}@g' $DESTINATION/resources.yaml
-        git add .
-        git commit -m "$COMMIT_MSG"
-        git push -f --set-upstream origin main        
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build, tag, and push the image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: back-admin
+          IMAGE_TAG: ${{ github.run_number }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "Pushing image to ECR..."
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+      
+      # kustomize 명령을 가져온다.
+      - name: Setup Kustomize
+        uses: imranismail/setup-kustomize@v1
+
+      - name: Checkout kustomize repository
+        uses: actions/checkout@v2
+        with:
+          # kubernetes 설정정보 저장소
+          repository: DGU2023xcapstone-parcel/exqress-kubernetes # k8s yaml 파일이 있는 repo
+          ref: main # branch 이름
+          # 다른 저장소에 push 하려면 Personal Access Token이 필요.
+          token: ${{ secrets.ACTION_TOKEN }}
+          path: exqress-kubernetes # 최상위 경로로 repository와 동일하게 설정
+
+      # 새 이미지 버전으로 파일 수정
+      - name: Update Kubernetes resources
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: back-admin
+          IMAGE_TAG: ${{ github.run_number }}
+        run: |
+          cd exqress-kubernetes
+          sed -i "s|image:.*|image: $ECR_REGISTRY\/$ECR_REPOSITORY:$IMAGE_TAG|g" back-admin-deploy.yaml # 새로 생성된 이미지로 교체하는 명령
+          
+      # 수정된 파일 commit & push
+      - name: Commit files
+        env:
+          ECR_REPOSITORY: back-admin
+          IMAGE_TAG: ${{ github.run_number }}
+        run: |
+          cd exqress-kubernetes
+          git config --global user.email "jypang0@github.com"
+          git config --global user.name "jypang0"
+          git commit -am "Update image $ECR_REPOSITORY tag $IMAGE_TAG"
+          git push -u origin main
