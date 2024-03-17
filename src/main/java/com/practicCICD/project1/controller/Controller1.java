@@ -12,7 +12,7 @@ import org.springframework.web.bind.annotation.*;
 public class Controller1 {
     @GetMapping("/hello")
     public String hello() {
-        return "hello hi";
+        return "hello";
     }
 
     private final TestService testService;
